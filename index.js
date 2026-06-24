@@ -119,19 +119,25 @@ async function restoreVanity(guild, t0) {
     console.log(`⚡ Vanity restaurée "${config.code}" en ${Date.now() - t0}ms`);
     return { ok: true };
   } catch (err) {
+    // On affiche le VRAI message d'erreur de Discord (sans rien supposer).
     const status = err?.status ?? err?.httpStatus;
-    const dcode = err?.code; // code d'erreur Discord (ex: 50013)
-    let reason;
-    if (status === 403 || dcode === 50013) {
-      reason = 'permission **Gérer le serveur** manquante (403).';
-    } else if (status === 429) {
-      const ra = err?.retryAfter ? Math.ceil(err.retryAfter) : '?';
-      reason = `rate-limit Discord sur le vanity (réessaie possible dans ~${ra}s). Cette limite peut durer longtemps si l'URL a été changée trop souvent.`;
-    } else {
-      reason = err?.message || 'erreur inconnue.';
+    const dcode = err?.code;
+    const dmsg = err?.rawError?.message || err?.message || 'erreur inconnue';
+    console.error('❌ Restauration vanity échouée — erreur Discord brute :', {
+      status,
+      code: dcode,
+      message: dmsg,
+    });
+
+    let hint = '';
+    if (status === 429 || /rate|limit/i.test(dmsg)) {
+      hint = ' → rate-limit du vanity (changé trop souvent). Attends quelques heures avant de retester.';
+    } else if (dcode === 50013) {
+      hint = ' → vérifie la permission "Gérer le serveur" / la hiérarchie du rôle du bot.';
+    } else if (status === 403) {
+      hint = ' → 403 malgré les perms : très probablement le rate-limit anti-spam du vanity (attends quelques heures).';
     }
-    console.error(`❌ Restauration vanity échouée : ${reason}`);
-    return { ok: false, reason };
+    return { ok: false, reason: `Discord ${status ?? '?'} (code ${dcode ?? '?'}) : ${dmsg}${hint}` };
   }
 }
 
