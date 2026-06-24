@@ -23,6 +23,7 @@ const {
   GatewayIntentBits,
   Partials,
   AuditLogEvent,
+  PermissionFlagsBits,
   EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
@@ -63,6 +64,7 @@ const DEFAULTS = {
   punishment: 'derank', // derank | kick | ban | none
   logChannelId: null,
   whitelist: [], // IDs autorisés à changer la vanity sans sanction
+  extraOwners: [], // co-owners ajoutés via %owner (en plus du propriétaire du bot)
 };
 
 function loadConfig() {
@@ -84,7 +86,10 @@ let config = loadConfig();
 
 // Owner du bot (rempli au démarrage à partir de l'application Discord)
 let OWNER_IDS = new Set();
-const isOwner = (id) => OWNER_IDS.has(id);
+// Propriétaire(s) de l'application : seuls eux peuvent gérer les co-owners.
+const isPrimaryOwner = (id) => OWNER_IDS.has(id);
+// Owner "effectif" = propriétaire de l'app OU co-owner ajouté via %owner.
+const isOwner = (id) => OWNER_IDS.has(id) || config.extraOwners.includes(id);
 
 // ------------------------------------------------------------
 //  CLIENT
@@ -106,21 +111,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ============================================================
 
 async function restoreVanity(guild, t0) {
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    try {
-      await guild.client.rest.patch(Routes.guildVanityUrl(guild.id), {
-        body: { code: config.code },
-        reason: 'LockURL: restauration vanity',
-      });
-      console.log(`⚡ Vanity restaurée "${config.code}" en ${Date.now() - t0}ms (essai ${attempt})`);
-      return true;
-    } catch (err) {
-      const wait = err?.retryAfter ? err.retryAfter * 1000 : 50 * attempt;
-      if (attempt < 4) await sleep(wait);
-      else console.error(`❌ Restauration échouée après 4 essais : ${err.message}`);
+  try {
+    await guild.client.rest.patch(Routes.guildVanityUrl(guild.id), {
+      body: { code: config.code },
+      reason: 'LockURL: restauration vanity',
+    });
+    console.log(`⚡ Vanity restaurée "${config.code}" en ${Date.now() - t0}ms`);
+    return { ok: true };
+  } catch (err) {
+    const status = err?.status ?? err?.httpStatus;
+    const dcode = err?.code; // code d'erreur Discord (ex: 50013)
+    let reason;
+    if (status === 403 || dcode === 50013) {
+      reason = 'permission **Gérer le serveur** manquante (403).';
+    } else if (status === 429) {
+      const ra = err?.retryAfter ? Math.ceil(err.retryAfter) : '?';
+      reason = `rate-limit Discord sur le vanity (réessaie possible dans ~${ra}s). Cette limite peut durer longtemps si l'URL a été changée trop souvent.`;
+    } else {
+      reason = err?.message || 'erreur inconnue.';
     }
+    console.error(`❌ Restauration vanity échouée : ${reason}`);
+    return { ok: false, reason };
   }
-  return false;
 }
 
 async function findExecutor(guild) {
@@ -172,23 +184,49 @@ async function punish(guild, executor, t0) {
   }
 }
 
-async function sendLog(guild, attempted, executor, ms) {
+async function sendLog(guild, attempted, executor, ms, restore) {
   if (!config.logChannelId) return;
   try {
     const channel = await guild.channels.fetch(config.logChannelId);
     if (!channel?.isTextBased()) return;
     const embed = new EmbedBuilder()
-      .setColor(0xff3b30)
-      .setTitle('🔒 Vol de vanity bloqué')
+      .setColor(restore.ok ? 0xff3b30 : 0xed4245)
+      .setTitle('🔒 Tentative de vol de vanity')
       .addFields(
         { name: 'Code tenté', value: `\`${attempted ?? 'aucun'}\``, inline: true },
-        { name: 'Code restauré', value: `\`${config.code}\``, inline: true },
+        {
+          name: 'Restauration',
+          value: restore.ok ? `✅ \`${config.code}\` remis` : `❌ ÉCHEC — ${restore.reason}`,
+          inline: true,
+        },
         { name: 'Réaction', value: `${ms}ms`, inline: true },
         { name: 'Auteur', value: executor ? `${executor} (\`${executor.id}\`)` : 'Inconnu' },
         { name: 'Sanction', value: config.punishment, inline: true },
       )
       .setTimestamp();
     await channel.send({ embeds: [embed] });
+  } catch {
+    /* ignore */
+  }
+}
+
+// Prévient l'owner quand la restauration échoue (salon de logs sinon MP).
+async function alertRestoreFailure(guild, reason) {
+  const text =
+    `⚠️ **La vanity a été modifiée mais je n'ai PAS pu la remettre.**\n` +
+    `Raison : ${reason}\n\n` +
+    `👉 Si c'est une permission : donne au bot **Gérer le serveur**.\n` +
+    `👉 Si c'est un rate-limit : attends que la limite Discord retombe (peut durer plusieurs heures si l'URL a beaucoup changé).`;
+  try {
+    if (config.logChannelId) {
+      const ch = await guild.channels.fetch(config.logChannelId);
+      if (ch?.isTextBased()) return void ch.send(text);
+    }
+    const ownerId = [...OWNER_IDS][0];
+    if (ownerId) {
+      const user = await client.users.fetch(ownerId);
+      await user.send(text);
+    }
   } catch {
     /* ignore */
   }
@@ -212,8 +250,9 @@ client.on('guildUpdate', (oldGuild, newGuild) => {
     return executor;
   })();
 
-  Promise.all([restoreP, punishP]).then(([, executor]) => {
-    sendLog(newGuild, attempted, executor, Date.now() - t0);
+  Promise.all([restoreP, punishP]).then(([restore, executor]) => {
+    sendLog(newGuild, attempted, executor, Date.now() - t0, restore);
+    if (!restore.ok) alertRestoreFailure(newGuild, restore.reason);
   });
 });
 
@@ -302,6 +341,7 @@ const HELP_CATEGORIES = {
         .addFields(
           { name: `${config.prefix}help`, value: 'Affiche ce panneau (owner).' },
           { name: `${config.prefix}lock`, value: 'Panneau de configuration (owner).' },
+          { name: `${config.prefix}owner`, value: 'Gérer les co-owners (propriétaire du bot).' },
           { name: 'Latence WebSocket', value: `${Math.max(0, Math.round(client.ws.ping))} ms`, inline: true },
           { name: 'Uptime', value: formatUptime(client.uptime), inline: true },
         )
@@ -422,9 +462,53 @@ client.on('messageCreate', async (message) => {
   const prefix = config.prefix || '%';
   if (!message.content.startsWith(prefix)) return;
 
-  const name = message.content.slice(prefix.length).trim().split(/\s+/)[0]?.toLowerCase();
-  if (name !== 'help' && name !== 'lock') return;
+  const parts = message.content.slice(prefix.length).trim().split(/\s+/);
+  const name = parts[0]?.toLowerCase();
+  if (name !== 'help' && name !== 'lock' && name !== 'owner') return;
   if (!isOwner(message.author.id)) return; // silencieux pour les autres
+
+  // --- %owner : gérer les co-owners (réservé au propriétaire de l'app) ---
+  if (name === 'owner') {
+    if (!isPrimaryOwner(message.author.id)) {
+      return message.reply('⛔ Seul le propriétaire du bot peut gérer les owners.').catch(() => {});
+    }
+    const sub = parts[1]?.toLowerCase();
+    const raw = parts[2] || '';
+    const targetId = raw.replace(/[<@!>]/g, ''); // accepte une mention ou un ID brut
+
+    if (sub === 'add') {
+      if (!/^\d{17,20}$/.test(targetId)) {
+        return message.reply(`Usage : \`${prefix}owner add @membre\` (ou son ID).`).catch(() => {});
+      }
+      if (OWNER_IDS.has(targetId)) {
+        return message.reply('ℹ️ Ce membre est déjà propriétaire du bot.').catch(() => {});
+      }
+      if (!config.extraOwners.includes(targetId)) {
+        config.extraOwners.push(targetId);
+        saveConfig();
+      }
+      return message.reply(`✅ <@${targetId}> peut désormais utiliser les commandes.`).catch(() => {});
+    }
+
+    if (sub === 'remove' || sub === 'rem' || sub === 'del') {
+      config.extraOwners = config.extraOwners.filter((i) => i !== targetId);
+      saveConfig();
+      return message.reply(`✅ <@${targetId}> n’est plus co-owner.`).catch(() => {});
+    }
+
+    // %owner list (par défaut)
+    const primary = [...OWNER_IDS].map((i) => `<@${i}> (propriétaire)`).join('\n') || '—';
+    const extras = config.extraOwners.map((i) => `<@${i}>`).join('\n') || 'aucun';
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('👑 Owners')
+      .addFields(
+        { name: 'Propriétaire(s) du bot', value: primary },
+        { name: 'Co-owners ajoutés', value: extras },
+      )
+      .setFooter({ text: `${prefix}owner add @membre  •  ${prefix}owner remove @membre` });
+    return message.reply({ embeds: [embed] }).catch(() => {});
+  }
 
   if (name === 'help') {
     if (!config.guildId) {
@@ -613,11 +697,17 @@ client.once('ready', async () => {
     console.warn('⚠️  Owner introuvable : les commandes ne répondront à personne.');
   }
 
-  // Pré-charge le bot dans le cache du serveur protégé (sanction instantanée).
+  // Pré-charge le bot dans le cache du serveur protégé (sanction instantanée)
+  // et vérifie qu'il a bien la permission de réécrire le vanity.
   if (config.guildId) {
     try {
       const guild = await client.guilds.fetch(config.guildId);
-      await guild.members.fetchMe();
+      const me = await guild.members.fetchMe();
+      if (!me.permissions.has(PermissionFlagsBits.ManageGuild)) {
+        console.warn(
+          '⚠️  ATTENTION : le bot n’a PAS la permission "Gérer le serveur" — il pourra sanctionner mais PAS remettre le vanity !',
+        );
+      }
     } catch {
       /* ignore */
     }
